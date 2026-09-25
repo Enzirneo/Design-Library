@@ -421,6 +421,9 @@
   .close { position: absolute; top: 12px; right: 12px; z-index: 6; background: var(--card); }
 
 
+  .card.sk { pointer-events: none; }
+  .sk-line { height: 12px; border-radius: 6px; background: var(--bg-soft); animation: shimmer 1.4s linear infinite; background-image: linear-gradient(100deg, transparent 30%, color-mix(in srgb, var(--text) 6%, transparent) 50%, transparent 70%); background-size: 200% 100%; }
+
   /* ---------- Add link ---------- */
   .add-btn { height: 38px; padding: 0 16px 0 12px; border-radius: 12px; background: var(--accent); color: var(--accent-ink); font-weight: 500; font-size: 13.5px; display: inline-flex; align-items: center; gap: 7px; transition: transform .3s var(--spring), box-shadow .3s; }
   .add-btn:hover { transform: translateY(-2px); box-shadow: 0 10px 26px -10px var(--accent); }
@@ -719,17 +722,21 @@
   // ---------- Data ----------
   let items = [], allTags = [];
   const hostOf = (u) => new URL(u).hostname.replace(/^www\./, "");
-  function buildItems(extra = []) {
+  // chave de unicidade: host + caminho (assim vários repositórios do github.com convivem)
+  const keyOf = (u) => { const x = new URL(u); return (x.hostname.replace(/^www\./, "") + x.pathname).replace(/\/$/, "").toLowerCase(); };
+  const shownOf = (u) => { const x = new URL(u); const h = hostOf(u); return /^(github|gitlab)\.com$/.test(h) ? (h + x.pathname).replace(/\/$/, "") : h; };
+  function buildItems(extra = []) { // extra = linhas vindas do Supabase
     const seen = new Set();
-    items = [...LINKS, ...extra].filter((l) => { const d = hostOf(l.url); if (seen.has(d)) return false; seen.add(d); return true; })
+    items = extra.filter((l) => { const k = keyOf(l.url); if (seen.has(k)) return false; seen.add(k); return true; })
       .map((l, i) => ({
-        ...l, id: i, domain: hostOf(l.url),
+        ...l, id: i, host: hostOf(l.url), domain: shownOf(l.url),
         cat: CATEGORIES[l.category] || { label: l.category, emoji: "•", color: "#888" },
       }));
     allTags = [...new Set(items.flatMap((i) => i.tags || []))].sort((a, b) => a.localeCompare(b, "pt"));
   }
   buildItems();
 
+  let loading = true, loadError = false;
   const state = {
     q: "", cat: "all", tags: new Set(),
     sort: store.get("dl-sort", "orig"),
@@ -778,7 +785,7 @@
     `https://image.thum.io/get/width/1200/crop/760/noanimate/${item.url}`,
     `https://api.microlink.io/?url=${encodeURIComponent(item.url)}&screenshot=true&meta=false&embed=screenshot.url`,
   ].filter(Boolean);
-  const favicon = (item) => `https://www.google.com/s2/favicons?domain=${item.domain}&sz=64`;
+  const favicon = (item) => `https://www.google.com/s2/favicons?domain=${item.host}&sz=64`;
   function loadShot(img, item, wrap) {
     const srcs = shotSources(item);
     let i = 0;
@@ -852,6 +859,15 @@
     $("#count span").textContent = list.length === 1 ? "referência" : "referências";
     syncHash();
 
+    if (loading) {
+      $("#count b").textContent = "…"; $("#count b").dataset.v = 0;
+      grid.innerHTML = Array.from({ length: 6 }, () => `<article class="card in sk"><div class="shot"><div class="skeleton"></div></div><div class="body"><div class="sk-line" style="width:55%"></div><div class="sk-line" style="width:90%"></div><div class="sk-line" style="width:70%"></div></div></article>`).join("");
+      return;
+    }
+    if (loadError) {
+      grid.innerHTML = `<div class="empty"><div class="big">!</div><h3>Não consegui carregar</h3><p>Verifique sua conexão e tente de novo.</p><button class="btn primary" data-retry>Tentar de novo</button></div>`;
+      return;
+    }
     if (!list.length) {
       const noFav = state.cat === "favs" && !state.favs.size && !state.q && !state.tags.size;
       grid.innerHTML = `<div class="empty"><div class="big">∅</div><h3>${noFav ? "Nenhum favorito ainda" : "Nada por aqui"}</h3>
@@ -1061,6 +1077,7 @@
   $("#grid").addEventListener("click", (e) => {
     if (e.target.closest("[data-ext]")) return;
     if (e.target.closest("[data-suggest]")) { openAdd(); return; }
+    if (e.target.closest("[data-retry]")) { loadLinks(); return; }
     if (e.target.closest("[data-reset]")) {
       state.q = ""; $("#q").value = ""; $("#searchBox").classList.remove("has"); state.cat = "all"; state.tags.clear(); render(); return;
     }
@@ -1189,18 +1206,23 @@
     headers: { apikey: CFG.SUPABASE_ANON_KEY, ...(CFG.SUPABASE_ANON_KEY.startsWith("eyJ") ? { Authorization: `Bearer ${CFG.SUPABASE_ANON_KEY}` } : {}), "Content-Type": "application/json", ...(opts.headers || {}) },
   });
   function updateCounts() {
-    updateCounts();
+    $("#eyebrow").textContent = loading ? "carregando referências…" : `${items.length} referências curadas`;
+    if (!loading) $("#lede").innerHTML = `Uma coleção pessoal de <b>bibliotecas e sites</b> em <b>${Object.keys(CATEGORIES).length} categorias</b> — componentes, motion, ícones, skills para agentes de IA e inspiração para desenvolver sites. Passe o mouse, clique e explore.`;
   }
-  async function loadCommunity() {
-    if (!backend) return;
-    try {
-      const r = await sb("links?select=name,url,category,description,tags&approved=eq.true&order=created_at.asc");
-      if (!r.ok) return;
-      const rows = (await r.json()).filter((x) => x && x.url && x.name);
-      if (!rows.length) return;
-      buildItems(rows.map((x) => ({ ...x, tags: x.tags || [] })));
-      updateCounts(); renderMarquee(); render();
-    } catch {}
+  async function loadLinks() {
+    loading = true; loadError = false; renderGrid();
+    let rows = null;
+    if (backend) {
+      try {
+        const r = await sb("links?select=name,url,category,description,tags&approved=eq.true&order=created_at.asc");
+        if (r.ok) { rows = await r.json(); store.set("dl-cache", rows); }
+      } catch {}
+    }
+    if (!rows) rows = store.get("dl-cache", null); // sem conexão: usa a última cópia salva
+    loading = false;
+    if (!rows) loadError = true;
+    buildItems((rows || []).filter((x) => x && x.url && x.name).map((x) => ({ ...x, tags: x.tags || [] })));
+    updateCounts(); renderMarquee(); render();
   }
 
   // ---------- Add-link form ----------
@@ -1239,8 +1261,8 @@
   let FORM_HTML = "";
   function openAdd() {
     if (FORM_HTML) resetForm();
-    F.tags = []; F.cat = Object.keys(CATEGORIES)[0]; F.touched = false;
-    $("#fCats").innerHTML = Object.entries(CATEGORIES).map(([k, c], i) => `<label><input type="radio" name="cat" value="${esc(k)}" ${i === 0 ? "checked" : ""}><span>${c.emoji} ${esc(c.label)}</span></label>`).join("");
+    F.tags = []; F.cat = CATEGORIES[state.cat] ? state.cat : Object.keys(CATEGORIES)[0]; F.touched = false;
+    $("#fCats").innerHTML = Object.entries(CATEGORIES).map(([k, c]) => `<label><input type="radio" name="cat" value="${esc(k)}" ${k === F.cat ? "checked" : ""}><span>${c.emoji} ${esc(c.label)}</span></label>`).join("");
     renderFormTags();
     $("#addOverlay").classList.add("open");
     $("#addOverlay").setAttribute("aria-hidden", "false");
@@ -1255,7 +1277,7 @@
   async function autofill() {
     const url = normalizeUrl($("#fUrl").value);
     if (!url) return;
-    if (items.some((i) => i.domain === hostOf(url))) { setErr("eUrl", "Esse site já está na biblioteca 🙌", "#fUrl"); return; }
+    if (items.some((i) => keyOf(i.url) === keyOf(url))) { setErr("eUrl", "Esse site já está na biblioteca 🙌", "#fUrl"); return; }
     setErr("eUrl", "", "#fUrl");
     if ($("#fName").value && $("#fDesc").value) return;
     const wrap = $("#urlWrap");
@@ -1296,7 +1318,7 @@
     let ok = true;
     setErr("eUrl", "", "#fUrl"); setErr("eName", "", "#fName"); setErr("eDesc", "", "#fDesc"); $("#eForm").textContent = "";
     if (!url) { setErr("eUrl", "Digite um endereço válido, como https://site.com", "#fUrl"); ok = false; }
-    else if (items.some((i) => i.domain === hostOf(url))) { setErr("eUrl", "Esse site já está na biblioteca 🙌", "#fUrl"); ok = false; }
+    else if (items.some((i) => keyOf(i.url) === keyOf(url))) { setErr("eUrl", "Esse site já está na biblioteca 🙌", "#fUrl"); ok = false; }
     if (name.length < 2) { setErr("eName", "Dê um nome ao site.", "#fName"); ok = false; }
     if (desc.length < 10) { setErr("eDesc", "Descreva em pelo menos 10 caracteres.", "#fDesc"); ok = false; }
     if (!ok) { $(".sheet .bad")?.focus(); return; }
@@ -1357,9 +1379,7 @@
   $("#swatches").innerHTML = ACCENTS.map((c) => `<button class="swatch" style="--c:${c}" data-c="${c}" role="radio" aria-label="Cor ${c}"></button>`).join("");
   $("#swatches").addEventListener("click", (e) => { const s = e.target.closest(".swatch"); if (s) applyAccent(s.dataset.c); });
 
-  const catCount = Object.keys(CATEGORIES).length;
-  $("#eyebrow").textContent = `${items.length} referências curadas`;
-  $("#lede").innerHTML = `Uma coleção pessoal de <b>bibliotecas e sites</b> em <b>${catCount} categorias</b> — componentes, motion, ícones e inspiração para desenvolver sites. Passe o mouse, clique e explore.`;
+  updateCounts();
   $("#count").innerHTML = `<b data-v="0">0</b> <span>referências</span>`;
 
   applyTheme(store.get("dl-theme", matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark"));
@@ -1369,7 +1389,7 @@
   render();
   requestAnimationFrame(placeIndicator);
   document.fonts?.ready.then(placeIndicator);
-  loadCommunity();
+  loadLinks();
 })();
 </script>
 </body>
